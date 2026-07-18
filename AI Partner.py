@@ -6,7 +6,8 @@ import json
 
 # LangChain 导入
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
+from langchain_core.tools import tool
 
 # Tavily 搜索
 from tavily import TavilyClient
@@ -33,14 +34,15 @@ MAX_HISTORY_MESSAGES = 12 if PUBLIC_MODE else 30
 MAX_OUTPUT_TOKENS = 500 if PUBLIC_MODE else 1000
 SEARCH_MAX_RESULTS = 3 if PUBLIC_MODE else 5
 
-# ======================== 联网搜索 ========================
+# ======================== Tavily 客户端 ========================
 
 tavily_api_key = get_secret("TAVILY_API_KEY")
 tavily_client = TavilyClient(api_key=tavily_api_key) if tavily_api_key else None
 
 
-def search_web(query):
-    """使用 Tavily 搜索互联网"""
+@tool
+def search_web(query: str) -> str:
+    """搜索实时信息、新闻、天气、知识类问题或需要联网确认的内容。"""
     try:
         if tavily_client is None:
             return "未配置 TAVILY_API_KEY，无法执行联网搜索。"
@@ -65,6 +67,8 @@ def search_web(query):
         return f"搜索失败: {str(e)}"
 
 
+tools = [search_web]
+
 # ======================== 页面配置 ========================
 
 st.set_page_config(
@@ -82,11 +86,9 @@ st.markdown(
         .stChatInput textarea {
             font-size: 16px !important;
         }
-
         .stButton button {
             min-height: 44px !important;
         }
-
         [data-testid="stChatMessage"],
         [data-testid="stChatMessage"] p {
             font-size: 16px !important;
@@ -106,14 +108,18 @@ if not api_key:
 
 deepseek_base_url = get_secret("DEEPSEEK_BASE_URL") or get_secret("DEEPSEEK_API_BASE") or "https://api.deepseek.com"
 
-# 初始化 LangChain ChatOpenAI
+# 初始化 LLM（不带流式，用于 ReAct 推理）
 llm = ChatOpenAI(
     model="deepseek-chat",
     openai_api_key=api_key,
     openai_api_base=deepseek_base_url,
     max_tokens=MAX_OUTPUT_TOKENS,
-    streaming=False  # 先不流式，后面手动流式处理
+    temperature=0.7,
+    streaming=False
 )
+
+# 将 Tool 绑定到 LLM，LLM 可通过 ReAct 循环自主决定是否调用
+llm_with_tools = llm.bind_tools(tools)
 
 # ======================== 辅助函数 ========================
 
@@ -132,7 +138,6 @@ def save_session():
     if PUBLIC_MODE:
         return
     if st.session_state.session_time_name:
-        # 将 LangChain 消息对象转为可序列化格式
         serializable_messages = []
         for msg in st.session_state.messages:
             if isinstance(msg, SystemMessage):
@@ -179,7 +184,6 @@ def load_session_data(session_time_name):
                 st.session_state.name = session_data["name"]
                 st.session_state.nature = session_data["nature"]
                 st.session_state.session_time_name = session_time_name
-                # 恢复为 LangChain 消息对象
                 restored_messages = []
                 for msg in session_data["messages"]:
                     role = msg.get("role", "")
@@ -210,6 +214,57 @@ def delete_session(session_time_name):
         st.error("删除会话信息失败!")
 
 
+# ======================== ReAct 推理循环 ========================
+
+def run_react_loop(messages):
+    """
+    标准 ReAct 循环：
+    1. LLM 接收消息 + Tool 定义
+    2. LLM 自主决定：调工具 or 直接回答
+    3. 如果调工具 → 执行 → 结果加回消息 → 回到步骤 2
+    4. 如果直接回答 → 返回最终结果
+    """
+    max_iterations = 3  # 最大推理步数，防止死循环
+    current_messages = list(messages)
+
+    for step in range(max_iterations):
+        response = llm_with_tools.invoke(current_messages)
+
+        # 如果 LLM 没有调用工具，直接返回最终回答
+        if not response.tool_calls:
+            return response.content, current_messages
+
+        # LLM 决定调用工具 → 执行工具调用
+        current_messages.append(response)
+        for tool_call in response.tool_calls:
+            if tool_call["name"] == "search_web":
+                try:
+                    arguments = json.loads(tool_call["args"]) if isinstance(tool_call["args"], str) else tool_call["args"]
+                    query = arguments.get("query", "")
+                    result = search_web.invoke(tool_call)
+                    current_messages.append(ToolMessage(content=result, tool_call_id=tool_call["id"]))
+                except Exception as e:
+                    current_messages.append(ToolMessage(content=f"工具执行失败: {str(e)}", tool_call_id=tool_call["id"]))
+
+    # 超过最大步数，返回最后一次结果
+    return "抱歉，我没有找到足够的信息来回答这个问题。" if not current_messages else current_messages[-1].content, current_messages
+
+
+# ======================== ReAct 流式输出 ========================
+
+def stream_react_final(messages):
+    """用流式 LLM 输出最终答案"""
+    streaming_llm = ChatOpenAI(
+        model="deepseek-chat",
+        openai_api_key=api_key,
+        openai_api_base=deepseek_base_url,
+        max_tokens=MAX_OUTPUT_TOKENS,
+        streaming=True,
+        temperature=0.7
+    )
+    return streaming_llm.stream(messages)
+
+
 # ======================== 页面标题 ========================
 
 st.title("AI智能伴侣")
@@ -221,7 +276,6 @@ if "messages" not in st.session_state:
     st.session_state.messages = []
 
 if "name" not in st.session_state:
-
     st.session_state.name = "星婉"
 
 if "nature" not in st.session_state:
@@ -270,7 +324,7 @@ with st.sidebar:
         st.session_state.nature = nature
 
     st.divider()
-    st.caption("💡 联网搜索已就绪 · 需要实时信息时将自动联网查询")
+    st.caption("💡 ReAct 推理引擎 · 需要时将自动联网查询")
 
 # ======================== 渲染聊天记录 ========================
 
@@ -279,14 +333,6 @@ for message in st.session_state.messages:
         st.chat_message("user").write(message.content)
     elif isinstance(message, AIMessage):
         st.chat_message("assistant").write(message.content)
-    elif isinstance(message, SystemMessage):
-        pass  # 不显示系统消息
-    else:
-        # 兼容旧格式
-        if message.get("role") == "user":
-            st.chat_message("user").write(message.get("content", ""))
-        elif message.get("role") == "assistant":
-            st.chat_message("assistant").write(message.get("content", ""))
 
 # ======================== 消息输入 ========================
 
@@ -301,13 +347,8 @@ if prompt:
     user_message = HumanMessage(content=prompt)
     st.session_state.messages.append(user_message)
 
-    # ===================== 联网搜索 =====================
-    web_context = ""
-    if tavily_client is not None:
-        web_context = search_web(prompt)
-
-    # ===================== 构建系统提示 =====================
-    system_prompt = f"""你叫{st.session_state.name}，现在是用户的真实伴侣，请完全代入伴侣角色。
+    # 构建系统提示
+    system_content = f"""你叫{st.session_state.name}，现在是用户的真实伴侣，请完全代入伴侣角色。
 当前本地日期时间:
     {get_current_datetime_context()}
 规则:
@@ -318,21 +359,15 @@ if prompt:
     5.有需要的话可以用等emoji表情
     6.用符合伴侣性格的方式对话
     7.回复的内容，要充分体现伴侣的性格特征
-    8.当用户询问今天日期、当前时间、星期几、今年是哪一年等本地时间问题时，必须直接根据当前本地日期时间回答
-    9.当用户询问实时新闻、天气、最新事件、联网资料，或需要外部信息确认的问题时，优先使用提供的上下文回答
+    8.当用户询问今天日期、当前时间、星期几、今年是哪一年等本地时间问题时，必须直接根据当前本地日期时间回答，不使用 search_web 工具
+    9.当用户询问实时新闻、天气、最新事件、联网资料，或需要外部信息确认的问题时，使用 search_web 工具搜索后再回答
 伴侣性格:
     10.回答必须正确，不能是错误答案
     {st.session_state.nature}
 你必须严格遵守上述规则来回复用户。"""
 
-    # 如果有联网搜索结果，加入系统提示
-    if web_context:
-        system_prompt += f"\n\n以下是联网搜索到的相关信息，请参考这些信息来回答：\n{web_context}"
-
-    # ===================== 构建 LangChain 消息列表 =====================
-    # 使用 LangChain 的 SystemMessage / HumanMessage / AIMessage 管理对话
-    api_messages = [SystemMessage(content=system_prompt)]
-    # 添加历史消息（最多 MAX_HISTORY_MESSAGES 条）
+    # 构建消息列表
+    api_messages = [SystemMessage(content=system_content)]
     history_messages = st.session_state.messages[-MAX_HISTORY_MESSAGES:]
     for msg in history_messages:
         if isinstance(msg, (HumanMessage, AIMessage)):
@@ -345,23 +380,19 @@ if prompt:
             elif role == "assistant":
                 api_messages.append(AIMessage(content=content))
 
-    # ===================== 流式调用 LangChain ChatOpenAI =====================
-    # 创建流式 LLM
-    streaming_llm = ChatOpenAI(
-        model="deepseek-chat",
-        openai_api_key=api_key,
-        openai_api_base=deepseek_base_url,
-        max_tokens=MAX_OUTPUT_TOKENS,
-        streaming=True,
-        temperature=0.7
-    )
-
-    full_session_state = st.empty()
-    full_response = ""
-
+    # ===================== ReAct 推理循环 =====================
     try:
-        # 使用 LangChain 的流式接口
-        stream = streaming_llm.stream(api_messages)
+        with st.spinner("思考中..."):
+            final_answer, updated_messages = run_react_loop(api_messages)
+
+        # 流式输出最终答案
+        full_session_state = st.empty()
+        full_response = ""
+
+        stream = stream_react_final([
+            SystemMessage(content=system_content),
+            HumanMessage(content=f"请根据以下信息回答用户的问题：\n\n{final_answer}")
+        ])
         for chunk in stream:
             if chunk.content:
                 content = chunk.content
