@@ -1,16 +1,26 @@
+"""
+AI 智能伴侣 — 基于 LangChain + LangGraph 的 AI 智能体
+=====================================================
+使用 LangChain 的 ChatOpenAI 调 DeepSeek API
+使用 LangGraph (StateGraph) 构建智能体工作流
+Tavily 搜索作为智能体的 Tool
+Streamlit 做前端界面
+"""
+
 import streamlit as st
 import os
 from dotenv import load_dotenv
 from datetime import datetime
 import json
+from typing import TypedDict, Annotated, Sequence
 
-# LangChain 导入
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
+from langchain_tavily import TavilySearch
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage
 from langchain_core.tools import tool
+from langgraph.prebuilt import create_react_agent
 
-# Tavily 搜索
-from tavily import TavilyClient
+# ======================== 配置和初始化 ========================
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(APP_DIR, ".env"))
@@ -34,40 +44,84 @@ MAX_HISTORY_MESSAGES = 12 if PUBLIC_MODE else 30
 MAX_OUTPUT_TOKENS = 500 if PUBLIC_MODE else 1000
 SEARCH_MAX_RESULTS = 3 if PUBLIC_MODE else 5
 
-# ======================== Tavily 客户端 ========================
+# API Keys
+deepseek_api_key = get_secret("DEEPSEEK_API_KEY")
+if not deepseek_api_key:
+    st.error("❌ DEEPSEEK_API_KEY 未配置，请在 Settings → Secrets 中添加")
+    st.stop()
+
+deepseek_base_url = (
+    get_secret("DEEPSEEK_BASE_URL")
+    or get_secret("DEEPSEEK_API_BASE")
+    or "https://api.deepseek.com"
+)
 
 tavily_api_key = get_secret("TAVILY_API_KEY")
-tavily_client = TavilyClient(api_key=tavily_api_key) if tavily_api_key else None
+
+# ======================== LangChain 工具定义 ========================
+
+# 使用 langchain_tavily 的官方封装（LangChain Tool）
+tavily_search_instance = (
+    TavilySearch(
+        tavily_api_key=tavily_api_key,
+        max_results=SEARCH_MAX_RESULTS,
+    )
+    if tavily_api_key
+    else None
+)
 
 
 @tool
 def search_web(query: str) -> str:
     """搜索实时信息、新闻、天气、知识类问题或需要联网确认的内容。"""
+    if tavily_search_instance is None:
+        return "未配置 TAVILY_API_KEY，无法执行联网搜索。"
     try:
-        if tavily_client is None:
-            return "未配置 TAVILY_API_KEY，无法执行联网搜索。"
-
-        result = tavily_client.search(
-            query=query,
-            search_depth="basic",
-            max_results=SEARCH_MAX_RESULTS
-        )
-        results = result.get("results", [])
+        results = tavily_search_instance.invoke({"query": query})
         if not results:
             return "没有找到相关搜索结果。"
-
-        formatted_results = []
-        for item in results:
-            title = item.get("title", "")
-            url = item.get("url", "")
-            content = item.get("content", "")
-            formatted_results.append(f"标题: {title}\n链接: {url}\n摘要: {content}")
-        return "\n\n".join(formatted_results)
+        # TavilySearch 返回的是 list[dict] 或 list[str]
+        if isinstance(results, list):
+            formatted = []
+            for r in results:
+                if isinstance(r, dict):
+                    title = r.get("title", "")
+                    url = r.get("url", "")
+                    content = r.get("content", "")
+                    formatted.append(f"标题: {title}\n链接: {url}\n摘要: {content}")
+                elif isinstance(r, str):
+                    formatted.append(r)
+            return "\n\n".join(formatted) if formatted else "没有找到相关搜索结果。"
+        return str(results)
     except Exception as e:
         return f"搜索失败: {str(e)}"
 
 
 tools = [search_web]
+
+# ======================== LangGraph 智能体构建 ========================
+
+
+class AgentState(TypedDict):
+    """LangGraph 状态定义"""
+    messages: Annotated[Sequence[BaseMessage], add_messages]
+
+
+# 初始化 LLM
+llm = ChatOpenAI(
+    model="deepseek-chat",
+    api_key=deepseek_api_key,
+    base_url=deepseek_base_url,
+    temperature=0.7,
+    max_tokens=MAX_OUTPUT_TOKENS,
+    streaming=False,  # 图内调用不需要 streaming
+)
+
+# 绑定工具到 LLM（LangChain 的 bind_tools → 自动生成 Function Calling 格式）
+llm_with_tools = llm.bind_tools(tools)
+# ======================== 构建智能体 ========================
+
+agent_graph = create_react_agent(llm, tools)
 
 # ======================== 页面配置 ========================
 
@@ -76,7 +130,7 @@ st.set_page_config(
     page_icon="🤖",
     layout="centered",
     initial_sidebar_state="collapsed",
-    menu_items={}
+    menu_items={},
 )
 
 st.markdown(
@@ -96,30 +150,8 @@ st.markdown(
     }
     </style>
     """,
-    unsafe_allow_html=True
+    unsafe_allow_html=True,
 )
-
-# ======================== API 初始化 ========================
-
-api_key = get_secret("DEEPSEEK_API_KEY")
-if not api_key:
-    st.error("❌ DEEPSEEK_API_KEY 未配置，请在 Settings → Secrets 中添加")
-    st.stop()
-
-deepseek_base_url = get_secret("DEEPSEEK_BASE_URL") or get_secret("DEEPSEEK_API_BASE") or "https://api.deepseek.com"
-
-# 初始化 LLM（不带流式，用于 ReAct 推理）
-llm = ChatOpenAI(
-    model="deepseek-chat",
-    openai_api_key=api_key,
-    openai_api_base=deepseek_base_url,
-    max_tokens=MAX_OUTPUT_TOKENS,
-    temperature=0.7,
-    streaming=False
-)
-
-# 将 Tool 绑定到 LLM，LLM 可通过 ReAct 循环自主决定是否调用
-llm_with_tools = llm.bind_tools(tools)
 
 # ======================== 辅助函数 ========================
 
@@ -138,26 +170,17 @@ def save_session():
     if PUBLIC_MODE:
         return
     if st.session_state.session_time_name:
-        serializable_messages = []
-        for msg in st.session_state.messages:
-            if isinstance(msg, SystemMessage):
-                serializable_messages.append({"role": "system", "content": msg.content})
-            elif isinstance(msg, HumanMessage):
-                serializable_messages.append({"role": "user", "content": msg.content})
-            elif isinstance(msg, AIMessage):
-                serializable_messages.append({"role": "assistant", "content": msg.content})
-            else:
-                serializable_messages.append({"role": msg.get("role", "user"), "content": msg.get("content", "")})
-
         session_data = {
             "name": st.session_state.name,
             "nature": st.session_state.nature,
             "session_time_name": st.session_state.session_time_name,
-            "messages": serializable_messages
+            "messages": st.session_state.messages,
         }
         if not os.path.exists("session"):
             os.mkdir("session")
-        with open(f"session/{st.session_state.session_time_name}.json", "w", encoding="utf-8") as f:
+        with open(
+            f"session/{st.session_state.session_time_name}.json", "w", encoding="utf-8"
+        ) as f:
             json.dump(session_data, f, ensure_ascii=False, indent=2)
 
 
@@ -178,25 +201,14 @@ def load_session_data(session_time_name):
     if PUBLIC_MODE:
         return
     try:
-        if os.path.exists(f"session/{session_time_name}.json"):
-            with open(f"session/{session_time_name}.json", "r", encoding="utf-8") as f:
+        filepath = f"session/{session_time_name}.json"
+        if os.path.exists(filepath):
+            with open(filepath, "r", encoding="utf-8") as f:
                 session_data = json.load(f)
                 st.session_state.name = session_data["name"]
                 st.session_state.nature = session_data["nature"]
                 st.session_state.session_time_name = session_time_name
-                restored_messages = []
-                for msg in session_data["messages"]:
-                    role = msg.get("role", "")
-                    content = msg.get("content", "")
-                    if role == "user":
-                        restored_messages.append(HumanMessage(content=content))
-                    elif role == "assistant":
-                        restored_messages.append(AIMessage(content=content))
-                    elif role == "system":
-                        restored_messages.append(SystemMessage(content=content))
-                    else:
-                        restored_messages.append(HumanMessage(content=content))
-                st.session_state.messages = restored_messages
+                st.session_state.messages = session_data["messages"]
     except Exception:
         st.error("加载会话信息失败!")
 
@@ -205,8 +217,9 @@ def delete_session(session_time_name):
     if PUBLIC_MODE:
         return
     try:
-        if os.path.exists(f"session/{session_time_name}.json"):
-            os.remove(f"session/{session_time_name}.json")
+        filepath = f"session/{session_time_name}.json"
+        if os.path.exists(filepath):
+            os.remove(filepath)
             if session_time_name == st.session_state.session_time_name:
                 st.session_state.messages = []
                 st.session_state.session_time_name = get_session_time_name()
@@ -214,55 +227,36 @@ def delete_session(session_time_name):
         st.error("删除会话信息失败!")
 
 
-# ======================== ReAct 推理循环 ========================
+# ======================== LangGraph 智能体调用 ========================
 
-def run_react_loop(messages):
+
+def run_agent(messages: list) -> str:
     """
-    标准 ReAct 循环：
-    1. LLM 接收消息 + Tool 定义
-    2. LLM 自主决定：调工具 or 直接回答
-    3. 如果调工具 → 执行 → 结果加回消息 → 回到步骤 2
-    4. 如果直接回答 → 返回最终结果
+    运行 LangGraph 智能体，返回最终回答。
+
     """
-    max_iterations = 3  # 最大推理步数，防止死循环
-    current_messages = list(messages)
+    # 将 dict 消息列表转为 LangChain Message 对象
+    lc_messages: list[BaseMessage] = []
+    for msg in messages:
+        role = msg["role"]
+        content = msg["content"]
+        if role == "system":
+            lc_messages.append(SystemMessage(content=content))
+        elif role == "user":
+            lc_messages.append(HumanMessage(content=content))
+        elif role == "assistant":
+            lc_messages.append(AIMessage(content=content))
 
-    for step in range(max_iterations):
-        response = llm_with_tools.invoke(current_messages)
+    # 运行 LangGraph 图
+    result = agent_graph.invoke({"messages": lc_messages})
 
-        # 如果 LLM 没有调用工具，直接返回最终回答
-        if not response.tool_calls:
-            return response.content, current_messages
+    # 从结果中提取最终 AIMessage 内容
+    final_messages = result["messages"]
+    for msg in reversed(final_messages):
+        if isinstance(msg, AIMessage) and msg.content:
+            return msg.content
 
-        # LLM 决定调用工具 → 执行工具调用
-        current_messages.append(response)
-        for tool_call in response.tool_calls:
-            if tool_call["name"] == "search_web":
-                try:
-                    arguments = json.loads(tool_call["args"]) if isinstance(tool_call["args"], str) else tool_call["args"]
-                    query = arguments.get("query", "")
-                    result = search_web.invoke(tool_call)
-                    current_messages.append(ToolMessage(content=result, tool_call_id=tool_call["id"]))
-                except Exception as e:
-                    current_messages.append(ToolMessage(content=f"工具执行失败: {str(e)}", tool_call_id=tool_call["id"]))
-
-    # 超过最大步数，返回最后一次结果
-    return "抱歉，我没有找到足够的信息来回答这个问题。" if not current_messages else current_messages[-1].content, current_messages
-
-
-# ======================== ReAct 流式输出 ========================
-
-def stream_react_final(messages):
-    """用流式 LLM 输出最终答案"""
-    streaming_llm = ChatOpenAI(
-        model="deepseek-chat",
-        openai_api_key=api_key,
-        openai_api_base=deepseek_base_url,
-        max_tokens=MAX_OUTPUT_TOKENS,
-        streaming=True,
-        temperature=0.7
-    )
-    return streaming_llm.stream(messages)
+    return "抱歉，我没有找到合适的回答。"
 
 
 # ======================== 页面标题 ========================
@@ -304,8 +298,15 @@ with st.sidebar:
         for session in session_list:
             col1, col2 = st.columns([4, 1])
             with col1:
-                if st.button(session, width="stretch", icon="📒", key=f"load_{session}",
-                             type="primary" if session == st.session_state.session_time_name else "secondary"):
+                if st.button(
+                    session,
+                    width="stretch",
+                    icon="📒",
+                    key=f"load_{session}",
+                    type="primary"
+                    if session == st.session_state.session_time_name
+                    else "secondary",
+                ):
                     load_session_data(session)
                     st.rerun()
             with col2:
@@ -316,23 +317,27 @@ with st.sidebar:
     st.divider()
 
     st.subheader("伴侣信息")
-    name = st.text_input("姓名", placeholder="请输入伴侣姓名", value=st.session_state.name)
+    name = st.text_input(
+        "姓名", placeholder="请输入伴侣姓名", value=st.session_state.name
+    )
     if name != st.session_state.name:
         st.session_state.name = name
-    nature = st.text_area("性格", placeholder="请输入伴侣性格", value=st.session_state.nature)
+    nature = st.text_area(
+        "性格", placeholder="请输入伴侣性格", value=st.session_state.nature
+    )
     if nature != st.session_state.nature:
         st.session_state.nature = nature
 
     st.divider()
-    st.caption("💡 ReAct 推理引擎 · 需要时将自动联网查询")
+    st.caption("💡 LangGraph 智能体引擎 · 自动联网查询")
 
 # ======================== 渲染聊天记录 ========================
 
 for message in st.session_state.messages:
-    if isinstance(message, HumanMessage):
-        st.chat_message("user").write(message.content)
-    elif isinstance(message, AIMessage):
-        st.chat_message("assistant").write(message.content)
+    if message["role"] == "user":
+        st.chat_message("user").write(message["content"])
+    elif message["role"] == "assistant":
+        st.chat_message("assistant").write(message["content"])
 
 # ======================== 消息输入 ========================
 
@@ -344,8 +349,7 @@ if prompt:
 
     # 显示用户消息
     st.chat_message("user").write(prompt)
-    user_message = HumanMessage(content=prompt)
-    st.session_state.messages.append(user_message)
+    st.session_state.messages.append({"role": "user", "content": prompt})
 
     # 构建系统提示
     system_content = f"""你叫{st.session_state.name}，现在是用户的真实伴侣，请完全代入伴侣角色。
@@ -367,32 +371,31 @@ if prompt:
 你必须严格遵守上述规则来回复用户。"""
 
     # 构建消息列表
-    api_messages = [SystemMessage(content=system_content)]
+    api_messages = [{"role": "system", "content": system_content}]
     history_messages = st.session_state.messages[-MAX_HISTORY_MESSAGES:]
     for msg in history_messages:
-        if isinstance(msg, (HumanMessage, AIMessage)):
-            api_messages.append(msg)
-        elif isinstance(msg, dict):
-            role = msg.get("role", "")
-            content = msg.get("content", "")
-            if role == "user":
-                api_messages.append(HumanMessage(content=content))
-            elif role == "assistant":
-                api_messages.append(AIMessage(content=content))
+        api_messages.append(msg)
 
-    # ===================== ReAct 推理循环 =====================
+    # ===================== LangGraph 智能体调用 =====================
     try:
         with st.spinner("思考中..."):
-            final_answer, updated_messages = run_react_loop(api_messages)
+            # 第1步：运行 LangGraph 智能体，获取推理结果
+            final_answer = run_agent(api_messages)
 
-        # 流式输出最终答案
+        # 第2步：流式输出最终回答（使用 LangChain 的流式接口）
         full_session_state = st.empty()
         full_response = ""
 
-        stream = stream_react_final([
-            SystemMessage(content=system_content),
-            HumanMessage(content=f"请根据以下信息回答用户的问题：\n\n{final_answer}")
-        ])
+        stream = llm.stream(
+            [
+                SystemMessage(
+                    content=system_content
+                ),
+                HumanMessage(
+                    content=f"请根据以下信息回答用户的问题（用伴侣的性格和语气，简短自然）：\n\n{final_answer}"
+                ),
+            ]
+        )
         for chunk in stream:
             if chunk.content:
                 content = chunk.content
@@ -408,5 +411,5 @@ if prompt:
         st.error(full_response)
 
     # 保存回复到会话
-    st.session_state.messages.append(AIMessage(content=full_response))
+    st.session_state.messages.append({"role": "assistant", "content": full_response})
     save_session()

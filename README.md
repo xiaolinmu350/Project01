@@ -1,11 +1,11 @@
 # 🤖 AI Partner
 
-基于 LangChain + Streamlit 的 AI 智能伴侣对话系统，支持联网搜索、多轮对话、会话管理，部署在公网可访问。
+基于 LangChain + LangGraph + Streamlit 的 AI 智能伴侣对话系统，支持联网搜索、多轮对话、会话管理，部署在公网可访问。
 
 ## 功能亮点
 
-- 🤖 **多轮对话** — 基于 DeepSeek + LangChain，支持上下文记忆
-- 🔍 **联网搜索** — 集成 Tavily 搜索，自动获取实时信息
+- 🤖 **LangGraph 智能体引擎** — 使用 `create_react_agent` 构建 Agent 工作流，自动管理 Tool 调用与推理循环
+- 🔍 **联网搜索** — 集成 Tavily Search，Agent 自主决策是否需要联网查询实时信息
 - 📱 **手机端适配** — 响应式界面，手机浏览器直接使用
 - 💾 **会话管理** — 保存/加载/删除历史会话，支持切换伴侣角色
 - 🎭 **自定义伴侣** — 可自由设置伴侣姓名和性格特征
@@ -13,7 +13,7 @@
 
 ## 在线体验
 
-👉 [点此访问](https://your-app-link.streamlit.app)
+👉 [点此访问](https://ai-partner.streamlit.app)
 
 ## 技术栈
 
@@ -21,9 +21,21 @@
 |------|------|
 | Python | 核心开发语言 |
 | LangChain | LLM 调用与消息管理 |
+| LangGraph | Agent 工作流编排（create_react_agent） |
 | Streamlit | 前端界面框架 |
 | DeepSeek-chat | 对话模型 |
 | Tavily API | 联网搜索工具 |
+
+## 架构说明
+
+```
+用户输入 → Streamlit 前端 → create_react_agent(Tool: search_web) → Agent 推理 → 流式输出
+```
+
+- Agent 使用 `create_react_agent` 自动完成 Thought→Action→Observation 循环
+- LLM 通过 `bind_tools` 绑定搜索工具，自主决策是否调用
+- Tavily Search 作为 LangChain Tool 注入 Agent
+- 先由 Agent 完成推理，再通过流式 LLM 输出带伴侣性格的回答
 
 ## 本地运行
 
@@ -47,7 +59,7 @@ streamlit run "AI Partner.py"
 
 ## 项目结构
 ```
-├── AI Partner.py        # 主程序
+├── AI Partner.py        # 主程序（LangGraph 智能体）
 ├── session/             # 会话数据存储
 ├── .env                 # 环境变量配置
 ├── .gitignore           # Git 忽略规则
